@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "DSH 浏览器桥接",
+    "description": "让 DSH 通过 WorkBuddy 浏览器扩展操作浏览器：导航标签页、截图、读取可见 DOM，以及点击、输入、滚动。",
+    "detail": "docs/DETAIL.md"
+  }
+}

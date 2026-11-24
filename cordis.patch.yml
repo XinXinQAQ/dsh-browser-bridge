@@ -1,0 +1,18 @@
+- insert:
+    - id: dsh-browser-bridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: browser
+        transport: stdio
+        command: 'C:\\Program Files\\nodejs\\node.exe'
+        args:
+          - 'C:\\Users\\25199\\.dsh\\browser-bridge\\native-host.mjs'
+        env:
+          DSH_BROWSER_BRIDGE_PORT: '18765'
+        toolCallTimeoutMs: 90000
+        startupTimeoutMs: 15000
+        reconnect:
+          enabled: true
+          initialDelayMs: 1000
+          maxDelayMs: 15000
+          maxAttempts: 20

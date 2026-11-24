@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "DSH browser bridge",
+    "description": "Let DSH control the WorkBuddy browser extension: navigate tabs, take screenshots, read the visible DOM, and click, type or scroll through agent tools.",
+    "detail": "docs/DETAIL.md"
+  }
+}
