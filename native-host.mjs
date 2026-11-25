@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 /**
- * DSH Browser Bridge
+ * DSH Browser Bridge  (v2 — broker architecture)
  *
- * One file, two modes:
+ * MODE=native (spawned by Chrome/Edge via Native Messaging host "com.workbuddy_ai.extension"):
+ *   stdin/stdout  <-> browser extension protocol (4-byte LE length prefix + JSON)
+ *   TCP CLIENT    <-> connects to broker at 127.0.0.1:PORT, registers, serves RPC.
+ *   Exits when the extension disconnects (stdin end/error/close) or on a stale lease.
  *
- *  MODE=native (spawned by Chrome/Edge via Native Messaging host "com.workbuddy_ai.extension"):
- *    stdin/stdout  <-> browser extension protocol (4-byte LE length prefix + JSON)
- *    TCP SERVER    <-> 127.0.0.1:PORT, newline-delimited JSON RPC (accepts many MCP clients)
+ * MODE=mcp (default; spawned by DSH's dsh-mcp-client over stdio):
+ *   stdin/stdout  <-> MCP JSON-RPC 2.0 (newline-delimited JSON)
+ *   TCP SERVER    <-> broker: accepts native hosts, tracks which one is ready,
+ *                     routes tool calls to the newest READY host.
  *
- *  MODE=mcp (default; spawned by DSH's dsh-mcp-client over stdio):
- *    stdin/stdout  <-> MCP JSON-RPC 2.0, newline-delimited JSON
- *    TCP CLIENT    <-> connects to the native host above, auto-reconnecting
- *
- * Rationale: the browser starts exactly ONE native host, so it owns the listening
- * socket. Any number of DSH harness instances can then attach their MCP servers
- * to that single browser connection without port conflicts.
+ * Why broker architecture: the browser may spawn several native hosts over time
+ * (and on restart). If a native host owned the listening port, a stale/zombie
+ * process could hold it forever and MCP would talk to a dead server. With the
+ * MCP process owning the port, any freshly started native host simply connects
+ * in and, once its extension handshake completes, becomes the active provider.
  *
  * No third-party dependencies: plain node:net / node:crypto.
  */
@@ -28,21 +30,23 @@ const HOST = '127.0.0.1';
 const LOG = process.env.DSH_BROWSER_BRIDGE_LOG || '';
 const PROTOCOL_VERSION = 1;
 const COMMAND_TIMEOUT_MS = 80000;
+const LEASE_TTL_MS = 30000;
+const STALE_AFTER_MS = 2 * LEASE_TTL_MS; // exit if no extension traffic for 60s
 
 function log(...args) {
   if (!LOG) return;
   try {
-    const line = `[${MODE} ${new Date().toISOString()}] ` +
+    const line = `[${MODE} ${process.pid} ${new Date().toISOString()}] ` +
       args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') + '\n';
     fs.appendFileSync(LOG, line);
   } catch {}
 }
 
 // =====================================================================
-// NATIVE MODE — speaks the browser extension protocol on stdin/stdout
+// NATIVE MODE
 // =====================================================================
 class ExtensionProtocol {
-  constructor() {
+  constructor(onStateChange) {
     this.buf = Buffer.alloc(0);
     this.ready = false;
     this.helloSeen = false;
@@ -51,15 +55,38 @@ class ExtensionProtocol {
     this.channelEpoch = null;
     this.nextId = 1;
     this.pending = new Map();
+    this.lastTrafficAt = Date.now();
+    this.onStateChange = onStateChange || (() => {});
+    this.dead = false;
   }
 
   start() {
     process.stdin.on('data', c => this._feed(c));
-    process.stdin.on('end', () => { this.ready = false; });
-    process.stdout.on('error', e => log('stdout error', String(e)));
+    const die = reason => {
+      if (this.dead) return;
+      this.dead = true;
+      this.ready = false;
+      this.onStateChange(false);
+      log('extension disconnected (' + reason + '); exiting native host');
+      setTimeout(() => process.exit(0), 50);
+    };
+    process.stdin.on('end', () => die('stdin end'));
+    process.stdin.on('close', () => die('stdin close'));
+    process.stdin.on('error', e => die('stdin error: ' + String(e)));
+    process.stdout.on('error', e => die('stdout error: ' + String(e)));
+
+    // Watchdog: if the extension goes half-open (no traffic beyond the renew
+    // cadence), exit so a fresh native host can take over cleanly.
+    this.watchdog = setInterval(() => {
+      if (!this.dead && Date.now() - this.lastTrafficAt > STALE_AFTER_MS) {
+        die('stale lease (' + STALE_AFTER_MS + 'ms no traffic)');
+      }
+    }, 10000);
+    this.watchdog.unref?.();
   }
 
   _feed(chunk) {
+    this.lastTrafficAt = Date.now();
     this.buf = Buffer.concat([this.buf, chunk]);
     while (this.buf.length >= 4) {
       const len = this.buf.readUInt32LE(0);
@@ -74,6 +101,7 @@ class ExtensionProtocol {
   }
 
   post(obj) {
+    if (this.dead) return;
     const data = Buffer.from(JSON.stringify(obj), 'utf8');
     const head = Buffer.alloc(4);
     head.writeUInt32LE(data.length, 0);
@@ -97,23 +125,24 @@ class ExtensionProtocol {
           protocol: PROTOCOL_VERSION,
           provider_epoch: this.providerEpoch,
           provider_instance_id: this.providerInstanceId,
-          lease_ttl_ms: 30000,
+          lease_ttl_ms: LEASE_TTL_MS,
         });
         this.ready = true;
         this.channelEpoch = 'dsh-' + crypto.randomUUID();
         this.post({
           type: 'channel_open',
           channel_epoch: this.channelEpoch,
-          lease_ttl_ms: 30000,
+          lease_ttl_ms: LEASE_TTL_MS,
           session_id: 'dsh-browser-bridge',
         });
         this.renewTimer = setInterval(() => {
-          if (this.ready && this.channelEpoch) {
-            this.post({ type: 'channel_renew', channel_epoch: this.channelEpoch, lease_deadline_ms: 30000 });
+          if (!this.dead && this.ready && this.channelEpoch) {
+            this.post({ type: 'channel_renew', channel_epoch: this.channelEpoch, lease_deadline_ms: LEASE_TTL_MS });
           }
         }, 10000);
         this.renewTimer.unref?.();
-        log('hello acked; extension', msg.extension_id, msg.browser_name, 'channel', this.channelEpoch);
+        log('hello acked; extension', msg.extension_id, msg.browser_name);
+        this.onStateChange(true);
         break;
       }
       case 'provider_result': {
@@ -126,8 +155,12 @@ class ExtensionProtocol {
         break;
       }
       case 'channel_closed':
-        log('channel_closed', msg.reason);
+        log('channel_closed by extension', msg.reason);
         this.ready = false;
+        this.onStateChange(false);
+        // channel closed means the extension dropped this channel; this host
+        // can no longer serve calls, so release everything for a fresh one.
+        setTimeout(() => { if (!this.dead) { this.dead = true; process.exit(0); } }, 50);
         break;
       case 'channel_close_ack':
         log('channel_close_ack');
@@ -137,19 +170,9 @@ class ExtensionProtocol {
     }
   }
 
-  async waitReady(timeoutMs = 5000) {
-    if (this.ready) return true;
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      await new Promise(r => setTimeout(r, 100));
-      if (this.ready) return true;
-    }
-    return false;
-  }
-
   call(method, params = {}) {
-    return new Promise(async (resolve, reject) => {
-      if (!(await this.waitReady(5000))) return reject(new Error('扩展尚未完成握手'));
+    return new Promise((resolve, reject) => {
+      if (this.dead || !this.ready || !this.channelEpoch) return reject(new Error('扩展尚未完成握手'));
       const id = this.nextId++;
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -162,45 +185,59 @@ class ExtensionProtocol {
 }
 
 function runNativeHost() {
-  const ext = new ExtensionProtocol();
+  const ext = new ExtensionProtocol(state => {
+    if (brokerSocket && !brokerSocket.destroyed) {
+      brokerSocket.write(JSON.stringify({ type: 'status', ready: state }) + '\n');
+    }
+  });
   ext.start();
-  log('native host started; listening TCP server on', PORT);
 
-  const server = net.createServer(socket => {
-    socket.setNoDelay(true);
-    log('MCP client connected from', socket.remotePort);
-    let buf = '';
-    socket.on('data', chunk => {
-      buf += chunk.toString('utf8');
+  let brokerSocket = null;
+  let rpcBuf = '';
+  let reconnectTimer = null;
+
+  function connectBroker() {
+    const s = net.createConnection({ host: HOST, port: PORT });
+    s.setNoDelay(true);
+    brokerSocket = s;
+    s.on('connect', () => {
+      log('connected to broker');
+      if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
+      s.write(JSON.stringify({ type: 'register', role: 'native', pid: process.pid, ready: ext.ready }) + '\n');
+    });
+    s.on('data', chunk => {
+      rpcBuf += chunk.toString('utf8');
       let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i).trim();
-        buf = buf.slice(i + 1);
+      while ((i = rpcBuf.indexOf('\n')) >= 0) {
+        const line = rpcBuf.slice(0, i).trim();
+        rpcBuf = rpcBuf.slice(i + 1);
         if (!line) continue;
         let req;
         try { req = JSON.parse(line); } catch { continue; }
         if (req.type === 'ping') {
-          socket.write(JSON.stringify({ type: 'pong', ready: ext.ready }) + '\n');
+          s.write(JSON.stringify({ type: 'pong', ready: ext.ready, pid: process.pid }) + '\n');
         } else if (req.type === 'call') {
           ext.call(req.method, req.params || {})
-            .then(result => {
-              if (!socket.destroyed) socket.write(JSON.stringify({ type: 'result', id: req.id, ok: true, result }) + '\n');
-            })
-            .catch(err => {
-              if (!socket.destroyed) socket.write(JSON.stringify({ type: 'result', id: req.id, ok: false, error: String(err && err.message || err) }) + '\n');
-            });
+            .then(result => { if (!s.destroyed) s.write(JSON.stringify({ type: 'result', id: req.id, ok: true, result }) + '\n'); })
+            .catch(err => { if (!s.destroyed) s.write(JSON.stringify({ type: 'result', id: req.id, ok: false, error: String(err && err.message || err) }) + '\n'); });
         }
       }
     });
-    socket.on('error', () => {});
-    socket.on('close', () => log('MCP client disconnected', socket.remotePort));
-  });
-  server.on('error', e => log('TCP listen error', String(e)));
-  server.listen(PORT, HOST, () => log('native host TCP server ready on', PORT));
+    s.on('error', () => {});
+    s.on('close', () => {
+      if (brokerSocket === s) brokerSocket = null;
+      if (ext.dead) return;
+      log('broker disconnected; retrying in 1.5s');
+      if (!reconnectTimer) reconnectTimer = setInterval(() => {
+        if (!brokerSocket || brokerSocket.destroyed) connectBroker();
+      }, 1500);
+    });
+  }
+  connectBroker();
 }
 
 // =====================================================================
-// MCP MODE — MCP stdio server + reconnecting TCP client to native host
+// MCP MODE — MCP stdio server + broker (TCP server)
 // =====================================================================
 const TOOLS = [
   { name: 'browser_status', description: '检查浏览器桥接是否连接到扩展，并返回浏览器能力信息及受控标签页列表。操作浏览器前先调用此工具。', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
@@ -219,73 +256,107 @@ const TOOLS = [
   { name: 'browser_finish', description: '结束浏览器会话，释放所有认领的标签页；agent 新建的标签页默认关闭，除非在 keep 中指定保留。', inputSchema: { type: 'object', properties: { keep: { type: 'array', items: { type: 'object', properties: { id: { type: ['string', 'number'] }, generation: { type: 'number' } }, required: ['id', 'generation'], additionalProperties: false } } }, additionalProperties: false } },
 ];
 
-class Bridge {
+class Broker {
   constructor() {
-    this.socket = null;
-    this.pending = new Map();
+    this.hosts = new Map();      // socket -> {ready, pid, id, lastSeen}
+    this.pending = new Map();    // rpc id -> {resolve, reject, timer}
     this.nextId = 1;
-    this.rpcBuf = '';
-    this.retry = null;
   }
 
-  connect() {
-    const s = net.createConnection({ host: HOST, port: PORT });
-    s.setNoDelay(true);
-    this.socket = s;
-    s.on('connect', () => {
-      log('connected to native host');
-      if (this.retry) { clearInterval(this.retry); this.retry = null; }
+  listen() {
+    this.server = net.createServer(socket => {
+      socket.setNoDelay(true);
+      const id = crypto.randomUUID();
+      const info = { id, ready: false, pid: null, lastSeen: Date.now() };
+      this.hosts.set(socket, info);
+      let buf = '';
+      log('native client connected', id);
+      socket.on('data', chunk => {
+        info.lastSeen = Date.now();
+        buf += chunk.toString('utf8');
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (!line) continue;
+          let msg;
+          try { msg = JSON.parse(line); } catch { continue; }
+          if (msg.type === 'register') {
+            info.ready = !!msg.ready;
+            info.pid = msg.pid ?? null;
+            info.lastSeen = Date.now();
+            log('native registered', id, 'pid', info.pid, 'ready', info.ready);
+          } else if (msg.type === 'status') {
+            info.ready = !!msg.ready;
+            info.lastSeen = Date.now();
+          } else if (msg.type === 'pong') {
+            info.ready = !!msg.ready;
+            info.pid = msg.pid ?? info.pid;
+            info.lastSeen = Date.now();
+          } else if (msg.type === 'result') {
+            const p = this.pending.get(msg.id);
+            if (!p) continue;
+            this.pending.delete(msg.id);
+            clearTimeout(p.timer);
+            if (msg.ok) p.resolve(msg.result);
+            else p.reject(new Error(msg.error || 'browser command failed'));
+          }
+        }
+      });
+      socket.on('error', () => {});
+      socket.on('close', () => {
+        this.hosts.delete(socket);
+        log('native client disconnected', id);
+      });
     });
-    s.on('data', c => this._feed(c));
-    s.on('error', () => {});
-    s.on('close', () => {
-      if (this.socket === s) this.socket = null;
-      for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('浏览器桥接连接断开')); }
-      this.pending.clear();
-      if (!this.retry) {
-        this.retry = setInterval(() => {
-          if (!this.socket || this.socket.destroyed) this.connect();
-        }, 1500);
+    this.server.on('error', e => {
+      log('broker listen error', String(e));
+      if (e && e.code === 'EADDRINUSE') {
+        // A stale broker process still owns the port. Retry until it frees.
+        log('broker port in use; retrying in 2s', PORT);
+        setTimeout(() => {
+          try { this.server.close(); } catch {}
+          this.server.listen(PORT, HOST);
+        }, 2000);
       }
     });
+    this.server.listen(PORT, HOST, () => log('broker listening on', PORT));
   }
 
-  _feed(chunk) {
-    this.rpcBuf += chunk.toString('utf8');
-    let i;
-    while ((i = this.rpcBuf.indexOf('\n')) >= 0) {
-      const line = this.rpcBuf.slice(0, i).trim();
-      this.rpcBuf = this.rpcBuf.slice(i + 1);
-      if (!line) continue;
-      let msg;
-      try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.type === 'result') {
-        const p = this.pending.get(msg.id);
-        if (!p) continue;
-        this.pending.delete(msg.id);
-        clearTimeout(p.timer);
-        if (msg.ok) p.resolve(msg.result);
-        else p.reject(new Error(msg.error));
-      }
+  activeHost() {
+    // Prefer the newest READY host. Fall back to none if all are stale.
+    let best = null;
+    for (const [socket, info] of this.hosts) {
+      if (!info.ready || socket.destroyed) continue;
+      if (Date.now() - info.lastSeen > STALE_AFTER_MS) continue;
+      if (!best || info.lastSeen > best.info.lastSeen) best = { socket, info };
     }
+    return best;
   }
 
-  async call(method, params = {}) {
-    if (!this.socket || this.socket.destroyed) {
-      for (let i = 0; i < 20 && (!this.socket || this.socket.destroyed); i++) await new Promise(r => setTimeout(r, 200));
-      if (!this.socket || this.socket.destroyed) throw new Error('浏览器扩展未连接：请确认扩展已启用，且原生消息宿主 com.workbuddy_ai.extension 已注册并已连接过一次。');
+  isReady() {
+    return !!this.activeHost();
+  }
+
+  call(method, params = {}) {
+    const active = this.activeHost();
+    if (!active) {
+      const anyHost = this.hosts.size > 0;
+      throw new Error(anyHost
+        ? '浏览器扩展尚未完成握手（连接已建立，请稍候或刷新扩展）'
+        : '浏览器扩展未连接：请确认扩展已启用，且原生消息宿主 com.workbuddy_ai.extension 已注册。');
     }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`RPC 超时: ${method}`)); }, COMMAND_TIMEOUT_MS + 5000);
       this.pending.set(id, { resolve, reject, timer });
-      this.socket.write(JSON.stringify({ type: 'call', id, method, params }) + '\n');
+      active.socket.write(JSON.stringify({ type: 'call', id, method, params }) + '\n');
     });
   }
 }
 
 class McpServer {
-  constructor(bridge) { this.bridge = bridge; this.buf = ''; }
+  constructor(broker) { this.broker = broker; this.buf = ''; }
   start() {
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', c => {
@@ -313,7 +384,7 @@ class McpServer {
       let result;
       switch (msg.method) {
         case 'initialize':
-          result = { protocolVersion: msg.params?.protocolVersion || '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'dsh-browser-bridge', version: '1.1.0' } };
+          result = { protocolVersion: msg.params?.protocolVersion || '2025-06-18', capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'dsh-browser-bridge', version: '2.0.0' } };
           break;
         case 'ping': result = {}; break;
         case 'resources/list': result = { resources: [] }; break;
@@ -333,10 +404,13 @@ class McpServer {
   async _call(params) {
     const name = params?.name;
     const a = params?.arguments || {};
-    const b = this.bridge;
+    const b = this.broker;
     try {
       switch (name) {
         case 'browser_status': {
+          if (!b.isReady()) {
+            return this.json({ connected: false, nativeHosts: b.hosts.size, hint: '扩展尚未连接。若刚重启浏览器/扩展，请等几秒再试；或刷新扩展页面。' });
+          }
           const info = await b.call('capability.negotiate');
           const tabs = await b.call('tabs.list');
           return this.json({ connected: true, info, controlledTabs: tabs });
@@ -392,9 +466,9 @@ class McpServer {
 }
 
 function runMcpServer() {
-  const bridge = new Bridge();
-  bridge.connect();
-  const mcp = new McpServer(bridge);
+  const broker = new Broker();
+  broker.listen();
+  const mcp = new McpServer(broker);
   mcp.start();
 }
 

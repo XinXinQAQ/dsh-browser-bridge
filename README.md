@@ -7,16 +7,17 @@
 WorkBuddy 浏览器扩展通过 Chrome Native Messaging 连接一个原生宿主。本插件把这个通道桥接成 MCP 工具供 DSH 调用：
 
 ```
-DSH ── mcp__browser__* (stdio MCP) ──> native-host.mjs (MCP client)
-                                          │ TCP 127.0.0.1:18765
-                                          v
-浏览器 ── Native Messaging ──> native-host.mjs --native (TCP server)
+DSH ── mcp__browser__* (stdio MCP) ──> native-host.mjs (MCP server / broker)
+                                          │ 持有 TCP 127.0.0.1:18765
+                                          │ 跟踪所有 native host，选用最新 READY 的那个
+                                          ^ TCP 连接
+浏览器 ── Native Messaging ──> native-host.mjs --native (TCP client)
                                           │ 扩展协议 (4字节长度前缀 JSON)
                                           v
                               WorkBuddy 浏览器扩展 ──> 真实标签页
 ```
 
-浏览器只启动一个 native host，因此由它持有 TCP 监听端口，DSH 侧的 MCP server 作为可自动重连的客户端。多个 DSH 实例可共享同一条浏览器连接。
+**为什么 broker 架构**：DSH 侧的 MCP 进程持有监听端口，浏览器中拉起的 native host 只作为客户端连入。这样浏览器重启 / 扩展重载 / 多个 native host 实例时，新的 native host 只要完成握手就自动接管，不会像旧架构那样被僵尸进程的端口占用卡死。native host 在扩展断开（stdin end/error/close）或租约过期时主动退出，broker 通过 heartbeat 追踪就绪状态。
 
 ## 前置条件
 
